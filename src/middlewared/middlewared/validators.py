@@ -1,8 +1,10 @@
+import ipaddress
+import re
+
+from croniter import croniter
 from datetime import time
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
-import ipaddress
-import re
 
 
 class ShouldBe(Exception):
@@ -101,3 +103,15 @@ class Range:
 
         if self.max is not None and value > self.max:
             raise ShouldBe(error)
+
+
+class CronField:
+    def __init__(self, place):
+        self.place = place
+
+    def __call__(self, value):
+        expression = '* ' * self.place + value + ' * ' * (4 - self.place)
+        try:
+            croniter(expression)
+        except Exception as e:
+            raise ShouldBe(str(e))

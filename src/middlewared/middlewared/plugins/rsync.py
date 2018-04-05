@@ -25,6 +25,7 @@
 #####################################################################
 
 import os
+import re
 import errno
 import pwd
 import tempfile
@@ -36,10 +37,10 @@ import glob
 import asyncio
 
 from collections import defaultdict
-from middlewared.schema import accepts, Bool, Dict, Str, Int, Ref, List
-from middlewared.validators import Range, Match
+from middlewared.schema import accepts, Bool, Dict, Str, Int, Ref, List, Patch
+from middlewared.validators import CronField, Range, Match
 from middlewared.service import (
-    Service, job, CallError, CRUDService, SystemServiceService, ValidationErrors
+    Service, job, CallError, CRUDService, private, SystemServiceService, ValidationErrors
 )
 from middlewared.logger import Logger
 
@@ -354,15 +355,19 @@ class RsyncTaskService(CRUDService):
     class Config:
         datastore = 'tasks.rsync'
         datastore_prefix = 'rsync_'
+        datastore_extend = 'rsynctask.rsync_task_extend'
 
+    @private
+    async def rsync_task_extend(self, data):
+        data['extra'] = list(filter(None, re.split(r"\s+", data["extra"])))
+        return data
+
+    @private
     async def validate_rsync_task(self, data, schema):
         verrors = ValidationErrors()
 
         # Windows users can have spaces in their usernames
         # http://www.freebsd.org/cgi/query-pr.cgi?pr=164808
-        if not data.get('user'):
-            verrors.add(f'{schema}.user', 'This field is required')
-            raise verrors
 
         username = data.get('user')
         if ' ' in username:
@@ -385,18 +390,6 @@ class RsyncTaskService(CRUDService):
             data['extra'] = ' '.join(data['extra'])
         else:
             data['extra'] = ''
-
-        if data.get('month'):
-            if len(data['month']) == 12:
-                data['month'] = '*'
-            else:
-                data['month'] = ','.join(data['month'])
-
-        if data.get('dayweek'):
-            if len(data['dayweek']) == 7:
-                data['dayweek'] = '*'
-            else:
-                data['dayweek'] = ",".join(data['dayweek'])
 
         mode = data.get('mode')
         if not mode:
@@ -519,9 +512,9 @@ class RsyncTaskService(CRUDService):
         return verrors, data
 
     @accepts(Dict(
-        'rsync_task',
+        'rsync_task_create',
         Str('path'),
-        Str('user'),
+        Str('user', required=True),
         Str('remotehost'),
         Int('remoteport'),
         Str('mode'),
@@ -530,11 +523,11 @@ class RsyncTaskService(CRUDService):
         Bool('validate_rpath'),
         Str('direction'),
         Str('desc'),
-        Str('minute'),
-        Str('hour'),
-        Str('daymonth'),
-        List('month', items=[Str('month')]),
-        List('dayweek', items=[Str('dayweek')]),
+        Str('minute', validators=[CronField(place=0)]),
+        Str('hour', validators=[CronField(place=1)]),
+        Str('daymonth', validators=[CronField(place=2)]),
+        Str('month', validators=[CronField(place=3)]),
+        Str('dayweek', validators=[CronField(place=4)]),
         Bool('recursive'),
         Bool('times'),
         Bool('compress'),
@@ -549,7 +542,7 @@ class RsyncTaskService(CRUDService):
         register=True,
     ))
     async def do_create(self, data):
-        verrors, data = await self.validate_rsync_task(data, 'rsync_task')
+        verrors, data = await self.validate_rsync_task(data, 'rsync_task_create')
         if verrors:
             raise verrors
 
@@ -563,17 +556,17 @@ class RsyncTaskService(CRUDService):
 
         return data
 
-    @accepts(Int('id'), Ref('rsync_task'))
+    @accepts(
+        Int('id', validators=[Range(min=1)]),
+        Patch('rsync_task_create', 'rsync_task_update', ('attr', {'update': True}))
+    )
     async def do_update(self, id, data):
-        task = await self.middleware.call(
-            'datastore.query',
-            self._config.datastore,
-            [('id', '=', id)],
-            {'prefix': self._config.datastore_prefix, 'get': True}
-        )
-        task.update(data)
+        old = await self.query(filters=[('id', '=', id)], options={'get': True})
 
-        verrors, data = await self.validate_rsync_task(task, 'rsync_task')
+        new = old.copy()
+        new.update(data)
+
+        verrors, data = await self.validate_rsync_task(new, 'rsync_task_update')
         if verrors:
             raise verrors
 
@@ -581,12 +574,12 @@ class RsyncTaskService(CRUDService):
             'datastore.update',
             self._config.datastore,
             id,
-            task,
+            new,
             {'prefix': self._config.datastore_prefix}
         )
         await self.middleware.call('service.reload', 'cron')
 
-        return task
+        return await self.query(filters=[('id', '=', id)], options={'get': True})
 
     @accepts(Int('id'))
     async def do_delete(self, id):
